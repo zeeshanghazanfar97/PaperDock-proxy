@@ -2,6 +2,11 @@
 
 FastAPI service exposing HTTP endpoints for CUPS (`lp`, `lpstat`, `lpoptions`, `cancel`) and SANE (`scanimage`).
 
+## API Documentation
+
+- Full API reference: [api.md](./api.md)
+- Interactive OpenAPI docs (when running): `http://localhost:8000/docs`
+
 ## 1) Install
 
 ```bash
@@ -31,6 +36,7 @@ Swagger UI:
 - `GET /scan/devices`: List scanners (`scanimage -L`)
 - `GET /scan/options?device=<uri>&all_options=true`: Scan capabilities (`scanimage --help --all-options`)
 - `POST /scan`: Scan to a saved file
+- `POST /scan/progress`: Scan with live progress stream (NDJSON)
 - `POST /scan/download`: Scan and immediately download the output
 - `POST /scan/raw`: Raw `scanimage` args passthrough (full SANE feature access)
 - `POST /copy`: Scan then print (photocopy workflow)
@@ -113,6 +119,18 @@ curl -s -X POST http://localhost:8000/scan/raw \
   -d '{
     "args":["--device-name","hpaio:/usb/HP_LaserJet_MFP_M129-M134?serial=VNFVY57093","--format=png","--resolution","300"]
   }' | jq
+```
+
+Scan with live progress stream:
+
+```bash
+curl -sN -X POST http://localhost:8000/scan/progress \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "device":"hpaio:/usb/HP_LaserJet_MFP_M129-M134?serial=VNFVY57093",
+    "format":"png",
+    "resolution":300
+  }'
 ```
 
 ## Notes

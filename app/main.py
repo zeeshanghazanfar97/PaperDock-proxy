@@ -5,14 +5,16 @@ import json
 import mimetypes
 import os
 import re
+import selectors
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Iterator, List, Optional, Union
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
@@ -325,7 +327,7 @@ def guess_suffix(scan_format: Optional[str]) -> str:
     return ".pnm"
 
 
-def execute_scan(request: ScanRequest) -> Dict[str, Any]:
+def build_scan_command(request: ScanRequest) -> List[str]:
     cmd = ["scanimage"]
     if request.device:
         cmd.extend(["--device-name", request.device])
@@ -337,10 +339,194 @@ def execute_scan(request: ScanRequest) -> Dict[str, Any]:
         cmd.extend(["--resolution", str(request.resolution)])
     cmd.extend(build_scan_options(request.options))
     cmd.extend(request.raw_args)
+    return cmd
 
-    is_batch_mode = any(
-        arg == "--batch" or arg.startswith("--batch=") for arg in cmd
-    )
+
+def is_batch_scan_command(cmd: List[str]) -> bool:
+    return any(arg == "--batch" or arg.startswith("--batch=") for arg in cmd)
+
+
+def extract_progress_values(stderr_line: str) -> List[float]:
+    values: List[float] = []
+    for match in re.finditer(r"(\d{1,3}(?:\.\d+)?)\s*%", stderr_line):
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            continue
+        if 0.0 <= value <= 100.0:
+            values.append(value)
+    return values
+
+
+def as_ndjson_event(payload: Dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=True) + "\n"
+
+
+def stream_scan_with_progress(request: ScanRequest) -> Iterator[str]:
+    cmd = build_scan_command(request)
+    if is_batch_scan_command(cmd):
+        raise HTTPException(
+            status_code=400,
+            detail="Progress streaming does not support batch scan mode. Remove --batch options.",
+        )
+
+    output_path = resolve_output_path(request.output_filename, guess_suffix(request.format))
+    started_at = time.time()
+
+    process: Optional[subprocess.Popen[bytes]] = None
+    selector: Optional[selectors.BaseSelector] = None
+    stdout_chunks = bytearray()
+    stderr_chunks: List[str] = []
+    stderr_line_buffer = ""
+    last_progress: Optional[float] = None
+    timed_out = False
+
+    def emit_stderr_line(line: str) -> Iterator[str]:
+        nonlocal last_progress
+        stripped = line.strip()
+        if not stripped:
+            return
+
+        progress_values = extract_progress_values(stripped)
+        if progress_values:
+            for progress in progress_values:
+                if last_progress is None or progress != last_progress:
+                    last_progress = progress
+                    yield as_ndjson_event(
+                        {
+                            "event": "progress",
+                            "progress": progress,
+                            "message": stripped,
+                            "timestamp_unix": time.time(),
+                        }
+                    )
+            return
+
+        yield as_ndjson_event(
+            {
+                "event": "log",
+                "message": stripped,
+                "timestamp_unix": time.time(),
+            }
+        )
+
+    try:
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=500, detail=f"Command not found: {cmd[0]}") from exc
+
+        if process.stdout is None or process.stderr is None:
+            process.kill()
+            process.wait()
+            raise HTTPException(status_code=500, detail="Failed to capture scanimage stdout/stderr.")
+
+        # Tell clients immediately which command/output is being used.
+        yield as_ndjson_event(
+            {
+                "event": "started",
+                "command": cmd,
+                "output_file": str(output_path),
+                "started_at_unix": started_at,
+            }
+        )
+
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+
+        deadline = time.monotonic() + request.timeout_seconds
+        while selector.get_map():
+            if time.monotonic() > deadline:
+                timed_out = True
+                process.kill()
+                break
+
+            events = selector.select(timeout=0.2)
+            if not events:
+                continue
+
+            for key, _ in events:
+                stream = key.fileobj
+                chunk = stream.read1(4096) if hasattr(stream, "read1") else stream.read(4096)
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+
+                if key.data == "stdout":
+                    stdout_chunks.extend(chunk)
+                    continue
+
+                stderr_text_chunk = chunk.decode("utf-8", errors="replace")
+                stderr_chunks.append(stderr_text_chunk)
+                stderr_line_buffer += stderr_text_chunk
+                parts = re.split(r"[\r\n]+", stderr_line_buffer)
+                stderr_line_buffer = parts.pop() if parts else ""
+                for part in parts:
+                    yield from emit_stderr_line(part)
+
+        # Emit any residual stderr text that wasn't newline-terminated.
+        yield from emit_stderr_line(stderr_line_buffer)
+
+        return_code = process.wait()
+        stderr_text = "".join(stderr_chunks)
+
+        if timed_out:
+            output_path.unlink(missing_ok=True)
+            yield as_ndjson_event(
+                {
+                    "event": "error",
+                    "message": f"Command timed out after {request.timeout_seconds}s",
+                    "command": cmd,
+                    "return_code": None,
+                    "stderr": stderr_text,
+                }
+            )
+            return
+
+        if return_code != 0:
+            output_path.unlink(missing_ok=True)
+            yield as_ndjson_event(
+                {
+                    "event": "error",
+                    "message": "Command failed",
+                    "command": cmd,
+                    "return_code": return_code,
+                    "stderr": stderr_text,
+                }
+            )
+            return
+
+        output_path.write_bytes(bytes(stdout_chunks))
+        completed_payload: Dict[str, Any] = {
+            "event": "completed",
+            "command": cmd,
+            "return_code": return_code,
+            "output_file": str(output_path),
+            "bytes_written": len(stdout_chunks),
+            "stderr": stderr_text,
+            "started_at_unix": started_at,
+            "completed_at_unix": time.time(),
+        }
+        if request.return_base64:
+            completed_payload["base64_data"] = base64.b64encode(bytes(stdout_chunks)).decode("ascii")
+        yield as_ndjson_event(completed_payload)
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+def execute_scan(request: ScanRequest) -> Dict[str, Any]:
+    cmd = build_scan_command(request)
+    is_batch_mode = is_batch_scan_command(cmd)
 
     if is_batch_mode:
         result = run_command(cmd, timeout_seconds=request.timeout_seconds, binary=False)
@@ -546,6 +732,15 @@ def list_scan_options(
 @app.post("/scan")
 def scan_document(request: ScanRequest) -> Dict[str, Any]:
     return execute_scan(request)
+
+
+@app.post("/scan/progress")
+def scan_document_with_progress(request: ScanRequest) -> StreamingResponse:
+    return StreamingResponse(
+        stream_scan_with_progress(request),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 @app.post("/scan/download")
