@@ -477,8 +477,10 @@ Each line is a JSON event:
 
 #### Notes
 
+- API automatically adds `--progress` to `scanimage` command unless you already passed `-p/--progress` in `raw_args`.
 - Batch mode (`--batch`) is not supported for this endpoint and returns `400`.
 - On failure or timeout, stream ends with an `error` event.
+- Some backends still do not emit percentage lines; in that case you will receive `started`, a final informational `log`, and `completed`.
 - Use `curl -N` (or equivalent) to disable output buffering in client.
 
 ---

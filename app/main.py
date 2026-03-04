@@ -346,6 +346,13 @@ def is_batch_scan_command(cmd: List[str]) -> bool:
     return any(arg == "--batch" or arg.startswith("--batch=") for arg in cmd)
 
 
+def ensure_progress_flag(cmd: List[str]) -> List[str]:
+    if "-p" in cmd or "--progress" in cmd:
+        return cmd
+    # Inject scanimage's generic progress flag right after binary name.
+    return [cmd[0], "--progress", *cmd[1:]]
+
+
 def extract_progress_values(stderr_line: str) -> List[float]:
     values: List[float] = []
     for match in re.finditer(r"(\d{1,3}(?:\.\d+)?)\s*%", stderr_line):
@@ -363,7 +370,7 @@ def as_ndjson_event(payload: Dict[str, Any]) -> str:
 
 
 def stream_scan_with_progress(request: ScanRequest) -> Iterator[str]:
-    cmd = build_scan_command(request)
+    cmd = ensure_progress_flag(build_scan_command(request))
     if is_batch_scan_command(cmd):
         raise HTTPException(
             status_code=400,
@@ -379,10 +386,11 @@ def stream_scan_with_progress(request: ScanRequest) -> Iterator[str]:
     stderr_chunks: List[str] = []
     stderr_line_buffer = ""
     last_progress: Optional[float] = None
+    progress_emitted = False
     timed_out = False
 
     def emit_stderr_line(line: str) -> Iterator[str]:
-        nonlocal last_progress
+        nonlocal last_progress, progress_emitted
         stripped = line.strip()
         if not stripped:
             return
@@ -400,6 +408,7 @@ def stream_scan_with_progress(request: ScanRequest) -> Iterator[str]:
                             "timestamp_unix": time.time(),
                         }
                     )
+                    progress_emitted = True
             return
 
         yield as_ndjson_event(
@@ -501,6 +510,18 @@ def stream_scan_with_progress(request: ScanRequest) -> Iterator[str]:
                 }
             )
             return
+
+        if not progress_emitted:
+            yield as_ndjson_event(
+                {
+                    "event": "log",
+                    "message": (
+                        "No percentage progress was emitted by scanimage/backend. "
+                        "The scan still completed successfully."
+                    ),
+                    "timestamp_unix": time.time(),
+                }
+            )
 
         output_path.write_bytes(bytes(stdout_chunks))
         completed_payload: Dict[str, Any] = {
