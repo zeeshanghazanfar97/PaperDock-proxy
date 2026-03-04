@@ -144,16 +144,25 @@ def run_command(args: List[str], timeout_seconds: int, binary: bool = False) -> 
 
 def parse_scan_devices(scanimage_output: str) -> List[Dict[str, str]]:
     devices: List[Dict[str, str]] = []
-    pattern = re.compile(r"device `(?P<device>[^`]+)` is a (?P<description>.+)$")
     for line in scanimage_output.splitlines():
-        match = pattern.search(line.strip())
-        if match:
-            devices.append(
-                {
-                    "device": match.group("device"),
-                    "description": match.group("description"),
-                }
-            )
+        stripped = line.strip()
+        if not stripped.startswith("device "):
+            continue
+        if " is a " not in stripped:
+            continue
+
+        device_part, description = stripped[len("device ") :].split(" is a ", 1)
+        device = device_part.strip().strip("`'\"")
+        description = description.strip()
+        if not device:
+            continue
+
+        devices.append(
+            {
+                "device": device,
+                "description": description,
+            }
+        )
     return devices
 
 
